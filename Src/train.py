@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F  # This was missing!
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 import numpy as np
@@ -82,7 +82,7 @@ class PPOTrainer:
                     response_mask_i = response_mask[i]
                     
                     # Find first non-pad token in response
-                    non_pad_indices = (response_tokens != self.model.tokenizer.pad_token_id).nonzero()
+                    non_pad_indices = (response_tokens != self.model.pad_token_id).nonzero()
                     
                     if len(non_pad_indices) > 0:
                         target_token = response_tokens[non_pad_indices[0]]
@@ -259,13 +259,14 @@ def train_model(args):
     # Initialize model
     model = RLChatModel(
         base_model_name=args.base_model,
+        tiktoken_encoding=args.tiktoken_encoding,
         max_length=args.max_length
     )
     
-    # Load dataset
+    # Load dataset (note: dataset now needs the model for tokenization)
     dataset = OASST2Dataset(
         data_path=args.data_path,
-        tokenizer=model.tokenizer,
+        model=model,  # Pass the model for tokenization
         max_length=args.max_length
     )
     
@@ -369,7 +370,9 @@ def train_model(args):
                 'optimizer_state_dict': optimizer.state_dict(),
                 'epoch': epoch,
                 'best_reward': best_reward,
-                'training_stats': trainer.training_stats
+                'training_stats': trainer.training_stats,
+                'tokenizer_encoding': args.tiktoken_encoding,
+                'vocab_size': model.vocab_size
             }, args.save_path)
             logger.info(f"Saved new best model with validation reward: {best_reward:.4f}")
         
@@ -451,8 +454,9 @@ def main():
     # Hardcoded configuration
     class Config:
         data_path = 'oasst1_train.jsonl'
-        save_path = 'rl_chat_model.pt'
+        save_path = 'rl_chat_model_tiktoken.pt'
         base_model = 'distilbert-base-uncased'
+        tiktoken_encoding = 'cl100k_base'  # GPT-4 encoding
         max_length = 512
         batch_size = 8
         learning_rate = 1e-4

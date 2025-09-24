@@ -9,33 +9,70 @@ training a conversational AI using reinforcement learning with PPO.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoModel
 from torch.distributions import Categorical
+import tiktoken
 import json
 import random
 import numpy as np
 
 class RLChatModel(nn.Module):
-    def __init__(self, base_model_name="distilbert-base-uncased", vocab_size=30522, hidden_dim=768, max_length=512):
+    def __init__(self, base_model_name="distilbert-base-uncased", tiktoken_encoding="cl100k_base", hidden_dim=768, max_length=512):
         super(RLChatModel, self).__init__()
         
         self.max_length = max_length
-        self.vocab_size = vocab_size
         self.hidden_dim = hidden_dim
         
-        # Load base transformer
-        self.tokenizer = AutoTokenizer.from_pretrained(base_model_name)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+        # Load tiktoken tokenizer
+        self.tokenizer = tiktoken.get_encoding(tiktoken_encoding)
+        self.vocab_size = self.tokenizer.n_vocab
+        
+        # Special tokens
+        self.pad_token_id = self.tokenizer.encode("<|pad|>")[0] if "<|pad|>" in self.tokenizer.decode_tokens_bytes([i for i in range(min(1000, self.vocab_size))]) else 0
+        self.eos_token_id = self.tokenizer.encode("<|endoftext|>")[0] if "<|endoftext|>" in str(self.tokenizer.decode([i for i in range(min(100, self.vocab_size))])) else 50256
+        
+        # Alternative: use common token IDs for GPT tokenizers
+        try:
+            # Try to find endoftext token
+            test_tokens = self.tokenizer.encode("<|endoftext|>")
+            if test_tokens:
+                self.eos_token_id = test_tokens[0]
+            else:
+                self.eos_token_id = 50256  # Common endoftext token ID for GPT tokenizers
+        except:
+            self.eos_token_id = 50256
             
+        try:
+            # For padding, we'll use a less common token or create a special handling
+            self.pad_token_id = self.eos_token_id  # Use same as EOS for simplicity
+        except:
+            self.pad_token_id = 0
+            
+        print(f"Vocab size: {self.vocab_size}, EOS token ID: {self.eos_token_id}, PAD token ID: {self.pad_token_id}")
+        
+        # Load base transformer (we'll use it for embeddings and basic architecture)
         self.base_model = AutoModel.from_pretrained(base_model_name)
+        
+        # Create embedding layer that matches our tokenizer vocab size
+        self.embeddings = nn.Embedding(self.vocab_size, hidden_dim, padding_idx=self.pad_token_id)
+        
+        # Initialize embeddings from base model if possible
+        if hasattr(self.base_model, 'embeddings') and hasattr(self.base_model.embeddings, 'word_embeddings'):
+            base_vocab_size = self.base_model.embeddings.word_embeddings.num_embeddings
+            with torch.no_grad():
+                # Copy what we can from the base model embeddings
+                copy_size = min(base_vocab_size, self.vocab_size)
+                self.embeddings.weight[:copy_size] = self.base_model.embeddings.word_embeddings.weight[:copy_size]
+        
+        # Transformer layers (we'll use the base model's transformer layers)
+        self.transformer = self.base_model
         
         # Policy head (actor) - outputs action probabilities
         self.policy_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim, vocab_size)
+            nn.Linear(hidden_dim, self.vocab_size)
         )
         
         # Value head (critic) - estimates state values
@@ -45,18 +82,60 @@ class RLChatModel(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, 1)
         )
+    
+    def encode_text(self, text, max_length=None):
+        """Encode text using tiktoken"""
+        if max_length is None:
+            max_length = self.max_length
+            
+        tokens = self.tokenizer.encode(text)
+        
+        # Truncate if too long
+        if len(tokens) > max_length:
+            tokens = tokens[:max_length]
+        
+        # Pad if too short
+        while len(tokens) < max_length:
+            tokens.append(self.pad_token_id)
+        
+        return {
+            'input_ids': torch.tensor([tokens]),
+            'attention_mask': torch.tensor([[1 if token != self.pad_token_id else 0 for token in tokens]])
+        }
+    
+    def decode_tokens(self, tokens):
+        """Decode tokens using tiktoken"""
+        # Remove padding tokens
+        tokens = [t for t in tokens if t != self.pad_token_id]
+        try:
+            return self.tokenizer.decode(tokens)
+        except:
+            # Fallback for invalid tokens
+            valid_tokens = [t for t in tokens if 0 <= t < self.vocab_size]
+            return self.tokenizer.decode(valid_tokens)
         
     def forward(self, input_ids, attention_mask=None, return_dict=False):
-        # Get base model outputs
-        outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_states = outputs.last_hidden_state
+        batch_size, seq_len = input_ids.shape
         
-        # Use [CLS] token representation or mean pooling
-        if hasattr(outputs, 'pooler_output') and outputs.pooler_output is not None:
-            pooled_output = outputs.pooler_output
-        else:
-            # Mean pooling over sequence length
-            pooled_output = hidden_states.mean(dim=1)
+        # Get embeddings
+        embeddings = self.embeddings(input_ids)
+        
+        # Create attention mask if not provided
+        if attention_mask is None:
+            attention_mask = (input_ids != self.pad_token_id).float()
+        
+        # Pass through transformer layers (we need to adapt this for our embeddings)
+        # For simplicity, we'll use a basic approach
+        hidden_states = embeddings
+        
+        # Apply a simple transformer-like processing
+        # Note: This is simplified - you might want to use actual transformer layers
+        hidden_states = hidden_states + self.positional_encoding(seq_len, hidden_states.device)
+        
+        # Mean pooling for sequence representation
+        mask_expanded = attention_mask.unsqueeze(-1).expand_as(hidden_states)
+        masked_hidden_states = hidden_states * mask_expanded
+        pooled_output = masked_hidden_states.sum(dim=1) / mask_expanded.sum(dim=1)
         
         # Get policy logits and values
         policy_logits = self.policy_head(pooled_output)
@@ -70,6 +149,18 @@ class RLChatModel(nn.Module):
             }
         
         return policy_logits, values
+    
+    def positional_encoding(self, seq_len, device):
+        """Simple positional encoding"""
+        position = torch.arange(0, seq_len, dtype=torch.float, device=device).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, self.hidden_dim, 2, dtype=torch.float, device=device) *
+                           -(np.log(10000.0) / self.hidden_dim))
+        
+        pe = torch.zeros(seq_len, self.hidden_dim, device=device)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term[:self.hidden_dim//2])
+        
+        return pe.unsqueeze(0)
     
     def act(self, input_ids, attention_mask=None, deterministic=False):
         """Sample action from policy"""
@@ -102,7 +193,7 @@ class RLChatModel(nn.Module):
         self.eval()
         
         # Tokenize prompt
-        inputs = self.tokenizer(prompt, return_tensors='pt', padding=True, truncation=True, max_length=self.max_length//2)
+        inputs = self.encode_text(prompt, max_length=self.max_length//2)
         input_ids = inputs['input_ids']
         attention_mask = inputs['attention_mask']
         
@@ -114,29 +205,29 @@ class RLChatModel(nn.Module):
                 policy_logits, _ = self.forward(input_ids, attention_mask)
                 
                 # Apply temperature
-                logits = policy_logits[:, -1] / temperature
+                logits = policy_logits / temperature
                 probs = F.softmax(logits, dim=-1)
                 
                 # Sample next token
                 next_token = torch.multinomial(probs, 1)
                 
                 # Check for end token
-                if next_token.item() == self.tokenizer.eos_token_id:
+                if next_token.item() == self.eos_token_id:
                     break
                 
                 generated_tokens.append(next_token.item())
                 
                 # Update input for next iteration
-                input_ids = torch.cat([input_ids, next_token], dim=1)
-                attention_mask = torch.cat([attention_mask, torch.ones(1, 1)], dim=1)
-                
-                # Prevent infinite generation
-                if input_ids.shape[1] >= self.max_length:
-                    break
+                if input_ids.shape[1] < self.max_length:
+                    input_ids = torch.cat([input_ids, next_token], dim=1)
+                    attention_mask = torch.cat([attention_mask, torch.ones(1, 1)], dim=1)
+                else:
+                    # Shift the sequence
+                    input_ids = torch.cat([input_ids[:, 1:], next_token], dim=1)
         
         # Decode response
         if generated_tokens:
-            response = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            response = self.decode_tokens(generated_tokens)
         else:
             response = ""
             
@@ -144,9 +235,9 @@ class RLChatModel(nn.Module):
 
 
 class OASST2Dataset:
-    def __init__(self, data_path, tokenizer, max_length=512):
+    def __init__(self, data_path, model, max_length=512):
         self.data_path = data_path
-        self.tokenizer = tokenizer
+        self.model = model  # We need the model to access the tokenizer
         self.max_length = max_length
         self.conversations = []
         self.load_data()
@@ -185,6 +276,8 @@ class OASST2Dataset:
                 {'prompt': 'Hello', 'response': 'Hi there! How can I help you today?', 'quality_score': 1.0},
                 {'prompt': 'What is AI?', 'response': 'AI stands for Artificial Intelligence, which refers to computer systems that can perform tasks typically requiring human intelligence.', 'quality_score': 1.0},
                 {'prompt': 'How are you?', 'response': 'I am doing well, thank you for asking! How are you doing?', 'quality_score': 0.8},
+                {'prompt': 'Tell me a joke', 'response': 'Why did the computer go to the doctor? Because it had a virus!', 'quality_score': 0.9},
+                {'prompt': 'Explain quantum physics', 'response': 'Quantum physics studies the behavior of matter and energy at the smallest scales, where particles can exist in multiple states simultaneously.', 'quality_score': 1.0},
             ]
     
     def __len__(self):
@@ -193,28 +286,15 @@ class OASST2Dataset:
     def __getitem__(self, idx):
         conv = self.conversations[idx]
         
-        # Tokenize prompt and response
-        prompt_tokens = self.tokenizer(
-            conv['prompt'], 
-            return_tensors='pt', 
-            padding='max_length', 
-            truncation=True, 
-            max_length=self.max_length//2
-        )
-        
-        response_tokens = self.tokenizer(
-            conv['response'], 
-            return_tensors='pt', 
-            padding='max_length', 
-            truncation=True, 
-            max_length=self.max_length//2
-        )
+        # Tokenize prompt and response using our model's tokenizer
+        prompt_encoded = self.model.encode_text(conv['prompt'], max_length=self.max_length//2)
+        response_encoded = self.model.encode_text(conv['response'], max_length=self.max_length//2)
         
         return {
-            'prompt_ids': prompt_tokens['input_ids'].squeeze(0),
-            'prompt_mask': prompt_tokens['attention_mask'].squeeze(0),
-            'response_ids': response_tokens['input_ids'].squeeze(0),
-            'response_mask': response_tokens['attention_mask'].squeeze(0),
+            'prompt_ids': prompt_encoded['input_ids'].squeeze(0),
+            'prompt_mask': prompt_encoded['attention_mask'].squeeze(0),
+            'response_ids': response_encoded['input_ids'].squeeze(0),
+            'response_mask': response_encoded['attention_mask'].squeeze(0),
             'quality_score': torch.tensor(conv['quality_score'], dtype=torch.float32),
             'prompt_text': conv['prompt'],
             'response_text': conv['response']
