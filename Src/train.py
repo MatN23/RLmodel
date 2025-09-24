@@ -327,7 +327,7 @@ def plot_training_stats(stats, save_path):
 def main():
     # Hardcoded configuration
     class Config:
-        data_path = 'data.jsonl'  # Path to your OASST2 format data file
+        data_path = 'oasst_train.jsonl'  # Path to your OASST2 format data file
         save_path = 'rl_chat_model.pt'
         base_model = 'distilbert-base-uncased'
         max_length = 512
